@@ -15432,6 +15432,14 @@ void Plater::export_toolpaths_to_obj() const
     p->preview->get_canvas3d()->export_toolpaths_to_obj(into_u8(path).c_str());
 }
 
+void Plater::show_toolpath_inertia_dialog() const
+{
+    if ((printer_technology() != ptFFF) || !is_preview_loaded())
+        return;
+
+    p->preview->show_inertia_analysis_dialog();
+}
+
 bool Plater::is_empty_project() {
     return model().objects.empty();
 }

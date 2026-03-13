@@ -31,6 +31,7 @@
 // this include must follow the wxWidgets ones or it won't compile on Windows -> see http://trac.wxwidgets.org/ticket/2421
 #include "libslic3r/Print.hpp"
 #include "libslic3r/SLAPrint.hpp"
+#include "libslic3r/GCode/InertiaAnalyzer.hpp"
 #include "NotificationManager.hpp"
 
 #ifdef _WIN32
@@ -413,6 +414,17 @@ void Preview::show_layers_sliders(bool show)
     ;//TODO
 }
 
+void Preview::show_inertia_analysis_dialog()
+{
+    if (m_gcode_result == nullptr) {
+        wxMessageBox(_L("No G-code preview result is available yet."), _L("Toolpath inertia"), wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    const GCodeInertiaResult result = analyze_gcode_inertia(*m_gcode_result);
+    const wxString report = from_u8(format_gcode_inertia_report(result));
+    wxMessageBox(report, _L("Toolpath inertia"), wxOK | (result.ok ? wxICON_INFORMATION : wxICON_WARNING), this);
+}
 
 void Preview::on_size(wxSizeEvent& evt)
 {

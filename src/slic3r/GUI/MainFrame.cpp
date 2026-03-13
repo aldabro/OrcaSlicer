@@ -2694,6 +2694,9 @@ void MainFrame::init_menubar_as_editor()
         append_menu_item(export_menu, wxID_ANY, _L("Export toolpaths as OBJ") + dots, _L("Export toolpaths as OBJ"),
             [this](wxCommandEvent&) { if (m_plater != nullptr) m_plater->export_toolpaths_to_obj(); }, "menu_export_toolpaths", nullptr,
             [this]() {return can_export_toolpaths(); }, this);
+        append_menu_item(export_menu, wxID_ANY, _L("Analyze toolpath inertia") + dots, _L("Calculate mass properties from sliced toolpaths"),
+            [this](wxCommandEvent&) { if (m_plater != nullptr) m_plater->show_toolpath_inertia_dialog(); }, "menu_export_toolpaths", nullptr,
+            [this]() {return can_export_toolpaths(); }, this);
 
         append_menu_item(
             export_menu, wxID_ANY, _L("Export Preset Bundle") + dots /* + "\t" + ctrl + "E"*/, _L("Export current configuration to files"),
@@ -3490,6 +3493,9 @@ void MainFrame::init_menubar_as_gcodeviewer()
         fileMenu->AppendSeparator();
         append_menu_item(fileMenu, wxID_ANY, _L("Export &Toolpaths as OBJ") + dots, _L("Export toolpaths as OBJ"),
             [this](wxCommandEvent&) { if (m_plater != nullptr) m_plater->export_toolpaths_to_obj(); }, "export_plater", nullptr,
+            [this]() {return can_export_toolpaths(); }, this);
+        append_menu_item(fileMenu, wxID_ANY, _L("Analyze Toolpath &Inertia") + dots, _L("Calculate mass properties from sliced toolpaths"),
+            [this](wxCommandEvent&) { if (m_plater != nullptr) m_plater->show_toolpath_inertia_dialog(); }, "export_plater", nullptr,
             [this]() {return can_export_toolpaths(); }, this);
         append_menu_item(fileMenu, wxID_ANY, _L("Open &Slicer") + dots, _L("Open Slicer"),
             [](wxCommandEvent&) { start_new_slicer(); }, "", nullptr,
