@@ -15432,12 +15432,26 @@ void Plater::export_toolpaths_to_obj() const
     p->preview->get_canvas3d()->export_toolpaths_to_obj(into_u8(path).c_str());
 }
 
-void Plater::show_toolpath_inertia_dialog() const
+void Plater::export_toolpath_inertia_analysis() const
 {
     if ((printer_technology() != ptFFF) || !is_preview_loaded())
         return;
 
-    p->preview->show_inertia_analysis_dialog();
+    fs::path output_file = p->get_export_file_path(FT_GCODE);
+    output_file.replace_extension("toolpath_inertia.json");
+    wxFileDialog dlg(const_cast<Plater*>(this), _L("Export Toolpath Inertia Analysis:"), from_path(output_file.parent_path()), from_path(output_file.filename()),
+        _L("JSON files (*.json)|*.json"), wxFD_SAVE | wxFD_OVERWRITE_PROMPT | wxPD_APP_MODAL);
+    if (dlg.ShowModal() == wxID_CANCEL)
+        return;
+
+    const wxString path = dlg.GetPath();
+    wxBusyCursor wait;
+    wxString error_message;
+    if (! p->preview->export_inertia_analysis_to_file(path, &error_message)) {
+        if (error_message.empty())
+            error_message = _L("Failed to export toolpath inertia analysis.");
+        wxMessageBox(error_message, _L("Export Toolpath Inertia Analysis"), wxOK | wxICON_WARNING, const_cast<Plater*>(this));
+    }
 }
 
 bool Plater::is_empty_project() {

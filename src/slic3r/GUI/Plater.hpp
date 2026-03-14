@@ -501,7 +501,7 @@ public:
     void reload_all_from_disk();
     bool has_toolpaths_to_export() const;
     void export_toolpaths_to_obj() const;
-    void show_toolpath_inertia_dialog() const;
+    void export_toolpath_inertia_analysis() const;
     void reslice();
     void record_slice_preset(std::string action);
     void reslice_SLA_supports(const ModelObject &object, bool postpone_error_messages = false);

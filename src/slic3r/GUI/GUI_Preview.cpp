@@ -33,6 +33,7 @@
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/GCode/InertiaAnalyzer.hpp"
 #include "NotificationManager.hpp"
+#include <boost/nowide/fstream.hpp>
 
 #ifdef _WIN32
 #include "BitmapComboBox.hpp"
@@ -414,16 +415,36 @@ void Preview::show_layers_sliders(bool show)
     ;//TODO
 }
 
-void Preview::show_inertia_analysis_dialog()
+bool Preview::export_inertia_analysis_to_file(const wxString& path, wxString* error_message)
 {
     if (m_gcode_result == nullptr) {
-        wxMessageBox(_L("No G-code preview result is available yet."), _L("Toolpath inertia"), wxOK | wxICON_INFORMATION, this);
-        return;
+        if (error_message != nullptr)
+            *error_message = _L("No G-code preview result is available yet.");
+        return false;
     }
 
-    const GCodeInertiaResult result = analyze_gcode_inertia(*m_gcode_result);
-    const wxString report = from_u8(format_gcode_inertia_report(result));
-    wxMessageBox(report, _L("Toolpath inertia"), wxOK | (result.ok ? wxICON_INFORMATION : wxICON_WARNING), this);
+    const Print& print = wxGetApp().plater()->get_partplate_list().get_current_fff_print();
+    const GCodeInertiaPlateResult result = analyze_gcode_inertia_by_object(*m_gcode_result, print);
+    if (! result.ok) {
+        if (error_message != nullptr)
+            *error_message = from_u8(result.error_message.empty() ? std::string("Toolpath inertia analysis returned no per-object result.") : result.error_message);
+        return false;
+    }
+
+    boost::nowide::ofstream file(into_u8(path));
+    if (! file.is_open()) {
+        if (error_message != nullptr)
+            *error_message = _L("Could not open the destination file for writing.");
+        return false;
+    }
+
+    file << format_gcode_inertia_json(result);
+    if (! file.good()) {
+        if (error_message != nullptr)
+            *error_message = _L("Failed while writing the JSON output file.");
+        return false;
+    }
+    return true;
 }
 
 void Preview::on_size(wxSizeEvent& evt)

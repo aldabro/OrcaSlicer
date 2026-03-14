@@ -1,9 +1,15 @@
 #include "InertiaAnalyzer.hpp"
 
+#include "Print.hpp"
+#include "Model.hpp"
+#include "nlohmann/json.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <set>
 #include <sstream>
+#include <boost/log/trivial.hpp>
 
 namespace Slic3r {
 namespace {
@@ -48,9 +54,8 @@ static Mat3d axis_inertia_matrix(double mass_kg, double radius_mm, double length
     const Mat3d uu = outer(axis);
     Mat3d mat{{ {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0} }};
     for (size_t i = 0; i < 3; ++i) {
-        for (size_t j = 0; j < 3; ++j) {
+        for (size_t j = 0; j < 3; ++j)
             mat[i][j] = ((i == j) ? i_perp : 0.0) + (i_parallel - i_perp) * uu[i][j];
-        }
     }
     return mat;
 }
@@ -61,9 +66,8 @@ static Mat3d parallel_axis(double mass_kg, const Arr3& displacement_mm)
     const Mat3d dd = outer(displacement_mm);
     Mat3d mat{{ {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0} }};
     for (size_t i = 0; i < 3; ++i) {
-        for (size_t j = 0; j < 3; ++j) {
+        for (size_t j = 0; j < 3; ++j)
             mat[i][j] = mass_kg * (((i == j) ? d2 : 0.0) - dd[i][j]);
-        }
     }
     return mat;
 }
@@ -98,6 +102,49 @@ struct SegmentRecord
     double length_mm{ 0.0 };
     Arr3 axis{ 0.0, 0.0, 1.0 };
 };
+
+struct InstanceLookup
+{
+    const PrintInstance* print_instance{ nullptr };
+    size_t instance_id{ 0 };
+    std::string object_name;
+};
+
+static Arr3 to_arr3(const Vec3d& v)
+{
+    return { v.x(), v.y(), v.z() };
+}
+
+static nlohmann::json to_json_array(const Arr3& v)
+{
+    return nlohmann::json::array({ v[0], v[1], v[2] });
+}
+
+static nlohmann::json to_json_matrix(const Mat3d& m)
+{
+    return nlohmann::json::array({
+        nlohmann::json::array({ m[0][0], m[0][1], m[0][2] }),
+        nlohmann::json::array({ m[1][0], m[1][1], m[1][2] }),
+        nlohmann::json::array({ m[2][0], m[2][1], m[2][2] })
+    });
+}
+
+static std::map<int, InstanceLookup> build_instance_lookup(const Print& print)
+{
+    std::map<int, InstanceLookup> lookup;
+    for (const PrintObject* print_object : print.objects()) {
+        if (print_object == nullptr || print_object->model_object() == nullptr)
+            continue;
+        const PrintInstances& instances = print_object->instances();
+        for (size_t instance_idx = 0; instance_idx < instances.size(); ++instance_idx) {
+            const PrintInstance& instance = instances[instance_idx];
+            if (instance.model_instance == nullptr)
+                continue;
+            lookup[int(instance.model_instance->get_labeled_id())] = InstanceLookup{ &instance, instance_idx, print_object->model_object()->name };
+        }
+    }
+    return lookup;
+}
 
 } // namespace
 
@@ -145,8 +192,7 @@ GCodeInertiaResult analyze_gcode_inertia(const GCodeProcessorResult& gcode_resul
             continue;
 
         const size_t extruder_id = size_t(curr.extruder_id);
-        const double density_g_cm3 = extruder_id < gcode_result.filament_densities.size() ?
-            double(gcode_result.filament_densities[extruder_id]) : 1.24;
+        const double density_g_cm3 = extruder_id < gcode_result.filament_densities.size() ? double(gcode_result.filament_densities[extruder_id]) : 1.24;
         const double mass_kg = volume_mm3 * density_g_cm3 * 1e-6;
         const double area_mm2 = volume_mm3 / length_mm;
         double radius_mm = 0.0;
@@ -178,17 +224,11 @@ GCodeInertiaResult analyze_gcode_inertia(const GCodeProcessorResult& gcode_resul
         return result;
     }
 
-    const Arr3 global_com{
-        weighted_com[0] / total_mass_kg,
-        weighted_com[1] / total_mass_kg,
-        weighted_com[2] / total_mass_kg
-    };
+    const Arr3 global_com{ weighted_com[0] / total_mass_kg, weighted_com[1] / total_mass_kg, weighted_com[2] / total_mass_kg };
     Mat3d total_inertia{{ {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0} }};
 
     for (const SegmentRecord& rec : records) {
-        total_inertia = add(total_inertia, add(
-            axis_inertia_matrix(rec.mass_kg, rec.radius_mm, rec.length_mm, rec.axis),
-            parallel_axis(rec.mass_kg, sub(rec.com, global_com))));
+        total_inertia = add(total_inertia, add(axis_inertia_matrix(rec.mass_kg, rec.radius_mm, rec.length_mm, rec.axis), parallel_axis(rec.mass_kg, sub(rec.com, global_com))));
     }
 
     result.ok = true;
@@ -198,6 +238,178 @@ GCodeInertiaResult analyze_gcode_inertia(const GCodeProcessorResult& gcode_resul
     result.inertia_tensor_kg_mm2 = total_inertia;
     result.extruders_used.assign(extruders_used.begin(), extruders_used.end());
     return result;
+}
+
+GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResult& gcode_result, const Print& print, const GCodeInertiaOptions& options)
+{
+    GCodeInertiaPlateResult plate_result;
+    plate_result.plate_index = size_t(std::max(0, print.get_plate_index()));
+
+    if (gcode_result.moves.size() < 2) {
+        plate_result.error_message = "Not enough preview move data available.";
+        return plate_result;
+    }
+
+    const std::map<int, InstanceLookup> instance_lookup = build_instance_lookup(print);
+    if (instance_lookup.empty()) {
+        plate_result.error_message = "Could not map preview object labels to sliced print instances.";
+        BOOST_LOG_TRIVIAL(info) << "Inertia analysis: instance lookup is empty for plate " << plate_result.plate_index;
+        return plate_result;
+    }
+
+    std::ostringstream instance_labels_ss;
+    for (const auto& [label_id, lookup] : instance_lookup) {
+        if (instance_labels_ss.tellp() > 0)
+            instance_labels_ss << ',';
+        instance_labels_ss << label_id;
+    }
+    BOOST_LOG_TRIVIAL(info) << "Inertia analysis: plate " << plate_result.plate_index << " instance labels = [" << instance_labels_ss.str() << "]";
+
+    struct ObjectAccumulator {
+        GCodeInertiaObjectResult result;
+        std::vector<SegmentRecord> records;
+        Arr3 weighted_com{ 0.0, 0.0, 0.0 };
+    };
+
+    std::map<int, ObjectAccumulator> accumulators;
+    const Vec3d plate_origin = print.get_plate_origin();
+    std::set<int> seen_move_labels;
+    size_t labeled_extrusion_moves = 0;
+    size_t matched_extrusion_moves = 0;
+
+    for (size_t i = 1; i < gcode_result.moves.size(); ++i) {
+        const auto& prev = gcode_result.moves[i - 1];
+        const auto& curr = gcode_result.moves[i];
+
+        if (curr.type != EMoveType::Extrude)
+            continue;
+        if (is_excluded_role(curr.extrusion_role, options))
+            continue;
+        if (curr.object_label_id < 0)
+            continue;
+
+        ++labeled_extrusion_moves;
+        seen_move_labels.insert(curr.object_label_id);
+
+        const auto instance_it = instance_lookup.find(curr.object_label_id);
+        if (instance_it == instance_lookup.end() || instance_it->second.print_instance == nullptr || instance_it->second.print_instance->model_instance == nullptr)
+            continue;
+
+        ++matched_extrusion_moves;
+
+        const double volume_mm3 = (double(curr.mm3_per_mm) > 0.0) ? std::max(double(curr.mm3_per_mm) * double(curr.travel_dist), 0.0) : 0.0;
+        const double dx_world = double(curr.position.x() - prev.position.x());
+        const double dy_world = double(curr.position.y() - prev.position.y());
+        const double dz_world = double(curr.position.z() - prev.position.z());
+        const double world_len = std::sqrt(dx_world * dx_world + dy_world * dy_world + dz_world * dz_world);
+        const double final_volume_mm3 = volume_mm3 > 0.0 ? volume_mm3 : double(curr.mm3_per_mm) * world_len;
+        if (final_volume_mm3 <= 0.0)
+            continue;
+
+        const ModelInstance* model_instance = instance_it->second.print_instance->model_instance;
+        const Eigen::Transform<double, 3, Eigen::Affine> inv = model_instance->get_matrix().inverse();
+        const Vec3d prev_plate = Vec3d(double(prev.position.x()) - plate_origin.x(), double(prev.position.y()) - plate_origin.y(), double(prev.position.z()) - plate_origin.z());
+        const Vec3d curr_plate = Vec3d(double(curr.position.x()) - plate_origin.x(), double(curr.position.y()) - plate_origin.y(), double(curr.position.z()) - plate_origin.z());
+        const Vec3d prev_obj = inv * prev_plate;
+        const Vec3d curr_obj = inv * curr_plate;
+        const Vec3d delta_obj = curr_obj - prev_obj;
+        const double length_mm = delta_obj.norm();
+        if (length_mm <= 1e-9)
+            continue;
+
+        const size_t extruder_id = size_t(curr.extruder_id);
+        const double density_g_cm3 = extruder_id < gcode_result.filament_densities.size() ? double(gcode_result.filament_densities[extruder_id]) : 1.24;
+        const double mass_kg = final_volume_mm3 * density_g_cm3 * 1e-6;
+        const double area_mm2 = final_volume_mm3 / length_mm;
+        double radius_mm = 0.0;
+        if (area_mm2 > 0.0)
+            radius_mm = std::sqrt(area_mm2 / PI);
+        if (! std::isfinite(radius_mm) || radius_mm <= 0.0)
+            radius_mm = std::sqrt(std::max(1e-9, double(curr.width) * double(curr.height)) / PI);
+
+        const Arr3 axis = to_arr3(delta_obj.normalized());
+        const Arr3 com = to_arr3(0.5 * (prev_obj + curr_obj));
+
+        ObjectAccumulator& acc = accumulators[curr.object_label_id];
+        if (acc.result.object_name.empty()) {
+            acc.result.object_label_id = curr.object_label_id;
+            acc.result.plate_index = plate_result.plate_index;
+            acc.result.instance_id = instance_it->second.instance_id;
+            acc.result.model_object_id = size_t(model_instance->get_object()->id().id);
+            acc.result.object_name = instance_it->second.object_name;
+        }
+
+        ++acc.result.extrusion_moves_total;
+        ++acc.result.extrusion_moves_used;
+        acc.result.volume_mm3 += final_volume_mm3;
+        acc.result.mass_kg += mass_kg;
+        acc.weighted_com[0] += mass_kg * com[0];
+        acc.weighted_com[1] += mass_kg * com[1];
+        acc.weighted_com[2] += mass_kg * com[2];
+        acc.records.push_back(SegmentRecord{ mass_kg, final_volume_mm3, com, radius_mm, length_mm, axis });
+
+        auto material_it = std::find_if(acc.result.materials.begin(), acc.result.materials.end(), [extruder_id](const GCodeInertiaMaterialUsage& item) {
+            return item.extruder_id == extruder_id;
+        });
+        if (material_it == acc.result.materials.end()) {
+            acc.result.materials.push_back(GCodeInertiaMaterialUsage{ unsigned(extruder_id), density_g_cm3, mass_kg, final_volume_mm3 });
+        } else {
+            material_it->mass_kg += mass_kg;
+            material_it->volume_mm3 += final_volume_mm3;
+            material_it->density_g_cm3 = density_g_cm3;
+        }
+    }
+
+    std::ostringstream move_labels_ss;
+    for (int label_id : seen_move_labels) {
+        if (move_labels_ss.tellp() > 0)
+            move_labels_ss << ',';
+        move_labels_ss << label_id;
+    }
+    BOOST_LOG_TRIVIAL(info) << "Inertia analysis: plate " << plate_result.plate_index
+                            << " labeled extrusion moves=" << labeled_extrusion_moves
+                            << ", matched=" << matched_extrusion_moves
+                            << ", move labels=[" << move_labels_ss.str() << "]";
+
+    for (auto& [label_id, acc] : accumulators) {
+        (void)label_id;
+        if (acc.result.mass_kg <= 0.0 || acc.records.empty()) {
+            acc.result.error_message = "No usable part extrusion moves found for this object.";
+            plate_result.objects.push_back(acc.result);
+            continue;
+        }
+
+        const Arr3 com{
+            acc.weighted_com[0] / acc.result.mass_kg,
+            acc.weighted_com[1] / acc.result.mass_kg,
+            acc.weighted_com[2] / acc.result.mass_kg
+        };
+        Mat3d inertia_com{{ {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0} }};
+        Mat3d inertia_origin{{ {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0} }};
+
+        for (const SegmentRecord& rec : acc.records) {
+            const Mat3d segment_body = axis_inertia_matrix(rec.mass_kg, rec.radius_mm, rec.length_mm, rec.axis);
+            inertia_com = add(inertia_com, add(segment_body, parallel_axis(rec.mass_kg, sub(rec.com, com))));
+            inertia_origin = add(inertia_origin, add(segment_body, parallel_axis(rec.mass_kg, rec.com)));
+        }
+
+        acc.result.ok = true;
+        acc.result.center_of_mass_in_object_frame_mm = com;
+        acc.result.inertia_about_com_kg_mm2 = inertia_com;
+        acc.result.inertia_about_object_origin_kg_mm2 = inertia_origin;
+        plate_result.objects.push_back(acc.result);
+    }
+
+    std::sort(plate_result.objects.begin(), plate_result.objects.end(), [](const GCodeInertiaObjectResult& a, const GCodeInertiaObjectResult& b) {
+        if (a.object_name != b.object_name)
+            return a.object_name < b.object_name;
+        return a.instance_id < b.instance_id;
+    });
+
+    plate_result.ok = ! plate_result.objects.empty();
+    if (! plate_result.ok && plate_result.error_message.empty())
+        plate_result.error_message = "No per-object part extrusions could be analyzed from the preview toolpaths.";
+    return plate_result;
 }
 
 std::string format_gcode_inertia_report(const GCodeInertiaResult& result)
@@ -234,6 +446,54 @@ std::string format_gcode_inertia_report(const GCodeInertiaResult& result)
     ss << "\nExcluded by default: skirt, brim, support, support interface/transition, wipe tower, custom.\n";
     ss << "Reference frame: current preview/toolpath coordinates.\n";
     return ss.str();
+}
+
+std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
+{
+    nlohmann::json root;
+    root["schema_version"] = 1;
+    root["generator"] = "OrcaSlicer";
+    root["analysis_type"] = "toolpath_inertia";
+    root["plate_index"] = result.plate_index;
+    root["ok"] = result.ok;
+    if (! result.error_message.empty())
+        root["error_message"] = result.error_message;
+    root["reference_frames"] = {
+        { "object_origin", "Original object/model coordinate system" },
+        { "com_frame", "Same axis orientation as object frame, translated to the center of mass" }
+    };
+    root["objects"] = nlohmann::json::array();
+
+    for (const GCodeInertiaObjectResult& object : result.objects) {
+        nlohmann::json j;
+        j["ok"] = object.ok;
+        j["object_name"] = object.object_name;
+        j["object_label_id"] = object.object_label_id;
+        j["instance_id"] = object.instance_id;
+        j["model_object_id"] = object.model_object_id;
+        j["plate_index"] = object.plate_index;
+        j["mass_kg"] = object.mass_kg;
+        j["volume_mm3"] = object.volume_mm3;
+        j["used_density_from_extruders"] = true;
+        j["center_of_mass_in_object_frame_mm"] = to_json_array(object.center_of_mass_in_object_frame_mm);
+        j["origin_to_com_offset_mm"] = to_json_array(object.center_of_mass_in_object_frame_mm);
+        j["inertia_about_object_origin_kg_mm2"] = to_json_matrix(object.inertia_about_object_origin_kg_mm2);
+        j["inertia_about_com_kg_mm2"] = to_json_matrix(object.inertia_about_com_kg_mm2);
+        if (! object.error_message.empty())
+            j["error_message"] = object.error_message;
+        j["materials"] = nlohmann::json::array();
+        for (const GCodeInertiaMaterialUsage& material : object.materials) {
+            j["materials"].push_back({
+                { "extruder_id", material.extruder_id },
+                { "density_g_cm3", material.density_g_cm3 },
+                { "mass_kg", material.mass_kg },
+                { "volume_mm3", material.volume_mm3 }
+            });
+        }
+        root["objects"].push_back(j);
+    }
+
+    return root.dump(2);
 }
 
 } // namespace Slic3r

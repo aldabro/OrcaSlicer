@@ -156,7 +156,7 @@ public:
     void show_sliders(bool show = true);
     void show_moves_sliders(bool show = true);
     void show_layers_sliders(bool show = true);
-    void show_inertia_analysis_dialog();
+    bool export_inertia_analysis_to_file(const wxString& path, wxString* error_message = nullptr);
     void set_reload_paint_after_background_process_apply(bool flag) { m_reload_paint_after_background_process_apply = flag; }
     bool get_reload_paint_after_background_process_apply() { return m_reload_paint_after_background_process_apply; }
 
