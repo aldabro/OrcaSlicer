@@ -32,6 +32,7 @@
 #include <wx/dnd.h>
 #include <wx/progdlg.h>
 #include <wx/string.h>
+#include <wx/textctrl.h>
 #include <wx/wupdlock.h>
 #include <wx/numdlg.h>
 #include <wx/debug.h>
@@ -15450,7 +15451,19 @@ void Plater::export_toolpath_inertia_analysis() const
     if (! p->preview->export_inertia_analysis_to_file(path, &error_message)) {
         if (error_message.empty())
             error_message = _L("Failed to export toolpath inertia analysis.");
-        wxMessageBox(error_message, _L("Export Toolpath Inertia Analysis"), wxOK | wxICON_WARNING, const_cast<Plater*>(this));
+
+        wxDialog dlg(const_cast<Plater*>(this), wxID_ANY, _L("Export Toolpath Inertia Analysis"),
+            wxDefaultPosition, wxSize(760, 420), wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+        auto* main_sizer = new wxBoxSizer(wxVERTICAL);
+        auto* text = new wxTextCtrl(&dlg, wxID_ANY, error_message, wxDefaultPosition, wxDefaultSize,
+            wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2 | wxHSCROLL);
+        text->SetMinSize(wxSize(700, 320));
+        text->SetSelection(-1, -1);
+        main_sizer->Add(text, 1, wxEXPAND | wxALL, 10);
+        main_sizer->Add(dlg.CreateStdDialogButtonSizer(wxOK), 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+        dlg.SetSizerAndFit(main_sizer);
+        dlg.SetMinSize(wxSize(760, 420));
+        dlg.ShowModal();
     }
 }
 

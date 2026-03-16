@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -108,6 +109,8 @@ struct InstanceLookup
     const PrintInstance* print_instance{ nullptr };
     size_t instance_id{ 0 };
     std::string object_name;
+    BoundingBoxf3 raw_mesh_bbox;
+    Eigen::Transform<double, 3, Eigen::Affine> object_to_plate_inv = Eigen::Transform<double, 3, Eigen::Affine>::Identity();
 };
 
 static Arr3 to_arr3(const Vec3d& v)
@@ -129,6 +132,88 @@ static nlohmann::json to_json_matrix(const Mat3d& m)
     });
 }
 
+template <typename T>
+static std::string join_values(const std::set<T>& values)
+{
+    std::ostringstream ss;
+    bool first = true;
+    for (const T& value : values) {
+        if (! first)
+            ss << ',';
+        ss << value;
+        first = false;
+    }
+    return ss.str();
+}
+
+static std::string join_instance_labels(const std::map<int, InstanceLookup>& lookup)
+{
+    std::set<int> labels;
+    for (const auto& [label_id, _] : lookup) {
+        (void)_;
+        labels.insert(label_id);
+    }
+    return join_values(labels);
+}
+
+template <typename BBoxType>
+static double point_to_bbox_distance_sq(const BBoxType& bbox, const Vec3d& point)
+{
+    const auto axis_distance_sq = [](double value, double min_v, double max_v) {
+        if (value < min_v) {
+            const double d = min_v - value;
+            return d * d;
+        }
+        if (value > max_v) {
+            const double d = value - max_v;
+            return d * d;
+        }
+        return 0.0;
+    };
+
+    return axis_distance_sq(point.x(), bbox.min.x(), bbox.max.x()) +
+           axis_distance_sq(point.y(), bbox.min.y(), bbox.max.y()) +
+           axis_distance_sq(point.z(), bbox.min.z(), bbox.max.z());
+}
+
+struct ResolvedUnlabeledInstance
+{
+    int label_id{ -1 };
+    const InstanceLookup* lookup{ nullptr };
+    Vec3d prev_obj{ Vec3d::Zero() };
+    Vec3d curr_obj{ Vec3d::Zero() };
+};
+
+static ResolvedUnlabeledInstance resolve_unlabeled_instance(const std::map<int, InstanceLookup>& instance_lookup, const Vec3d& prev_plate, const Vec3d& curr_plate)
+{
+    constexpr double containment_tolerance_mm = 1.0;
+
+    ResolvedUnlabeledInstance best;
+    double best_distance_sq = std::numeric_limits<double>::infinity();
+    bool found_contained = false;
+    const Vec3d midpoint_plate = 0.5 * (prev_plate + curr_plate);
+
+    for (const auto& [label_id, lookup] : instance_lookup) {
+        const Vec3d prev_obj = lookup.object_to_plate_inv * prev_plate;
+        const Vec3d curr_obj = lookup.object_to_plate_inv * curr_plate;
+        const Vec3d midpoint_obj = lookup.object_to_plate_inv * midpoint_plate;
+        const auto bbox = lookup.raw_mesh_bbox.inflated(containment_tolerance_mm);
+        const bool contained = bbox.contains(midpoint_obj);
+        const double distance_sq = point_to_bbox_distance_sq(bbox, midpoint_obj);
+
+        if ((contained && ! found_contained) || (contained == found_contained && distance_sq < best_distance_sq)) {
+            found_contained = contained;
+            best_distance_sq = distance_sq;
+            best.label_id = label_id;
+            best.lookup = &lookup;
+            best.prev_obj = prev_obj;
+            best.curr_obj = curr_obj;
+        }
+    }
+
+    return best;
+}
+
 static std::map<int, InstanceLookup> build_instance_lookup(const Print& print)
 {
     std::map<int, InstanceLookup> lookup;
@@ -140,7 +225,13 @@ static std::map<int, InstanceLookup> build_instance_lookup(const Print& print)
             const PrintInstance& instance = instances[instance_idx];
             if (instance.model_instance == nullptr)
                 continue;
-            lookup[int(instance.model_instance->get_labeled_id())] = InstanceLookup{ &instance, instance_idx, print_object->model_object()->name };
+            lookup[int(instance.model_instance->get_labeled_id())] = InstanceLookup{
+                &instance,
+                instance_idx,
+                print_object->model_object()->name,
+                print_object->model_object()->raw_mesh_bounding_box(),
+                instance.model_instance->get_matrix().inverse()
+            };
         }
     }
     return lookup;
@@ -252,18 +343,13 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
 
     const std::map<int, InstanceLookup> instance_lookup = build_instance_lookup(print);
     if (instance_lookup.empty()) {
-        plate_result.error_message = "Could not map preview object labels to sliced print instances.";
+        plate_result.error_message = "Could not map preview object labels to sliced print instances for the current plate.";
         BOOST_LOG_TRIVIAL(info) << "Inertia analysis: instance lookup is empty for plate " << plate_result.plate_index;
         return plate_result;
     }
 
-    std::ostringstream instance_labels_ss;
-    for (const auto& [label_id, lookup] : instance_lookup) {
-        if (instance_labels_ss.tellp() > 0)
-            instance_labels_ss << ',';
-        instance_labels_ss << label_id;
-    }
-    BOOST_LOG_TRIVIAL(info) << "Inertia analysis: plate " << plate_result.plate_index << " instance labels = [" << instance_labels_ss.str() << "]";
+    const std::string instance_labels = join_instance_labels(instance_lookup);
+    BOOST_LOG_TRIVIAL(info) << "Inertia analysis: plate " << plate_result.plate_index << " instance labels = [" << instance_labels << "]";
 
     struct ObjectAccumulator {
         GCodeInertiaObjectResult result;
@@ -274,8 +360,14 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
     std::map<int, ObjectAccumulator> accumulators;
     const Vec3d plate_origin = print.get_plate_origin();
     std::set<int> seen_move_labels;
+    size_t eligible_extrusion_moves = 0;
     size_t labeled_extrusion_moves = 0;
+    size_t unlabeled_extrusion_moves = 0;
     size_t matched_extrusion_moves = 0;
+    size_t single_instance_fallback_moves = 0;
+    size_t bbox_resolved_unlabeled_moves = 0;
+    const bool use_single_instance_fallback = instance_lookup.size() == 1;
+    const int single_instance_label_id = use_single_instance_fallback ? instance_lookup.begin()->first : -1;
 
     for (size_t i = 1; i < gcode_result.moves.size(); ++i) {
         const auto& prev = gcode_result.moves[i - 1];
@@ -285,13 +377,37 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
             continue;
         if (is_excluded_role(curr.extrusion_role, options))
             continue;
-        if (curr.object_label_id < 0)
-            continue;
 
-        ++labeled_extrusion_moves;
-        seen_move_labels.insert(curr.object_label_id);
+        ++eligible_extrusion_moves;
 
-        const auto instance_it = instance_lookup.find(curr.object_label_id);
+        const Vec3d prev_plate = Vec3d(double(prev.position.x()) - plate_origin.x(), double(prev.position.y()) - plate_origin.y(), double(prev.position.z()) - plate_origin.z());
+        const Vec3d curr_plate = Vec3d(double(curr.position.x()) - plate_origin.x(), double(curr.position.y()) - plate_origin.y(), double(curr.position.z()) - plate_origin.z());
+
+        int effective_label_id = curr.object_label_id;
+        const InstanceLookup* chosen_lookup = nullptr;
+        Vec3d prev_obj;
+        Vec3d curr_obj;
+        if (curr.object_label_id < 0) {
+            ++unlabeled_extrusion_moves;
+            if (use_single_instance_fallback) {
+                effective_label_id = single_instance_label_id;
+                ++single_instance_fallback_moves;
+            } else {
+                const ResolvedUnlabeledInstance resolved = resolve_unlabeled_instance(instance_lookup, prev_plate, curr_plate);
+                if (resolved.lookup == nullptr)
+                    continue;
+                effective_label_id = resolved.label_id;
+                chosen_lookup = resolved.lookup;
+                prev_obj = resolved.prev_obj;
+                curr_obj = resolved.curr_obj;
+                ++bbox_resolved_unlabeled_moves;
+            }
+        } else {
+            ++labeled_extrusion_moves;
+            seen_move_labels.insert(curr.object_label_id);
+        }
+
+        const auto instance_it = instance_lookup.find(effective_label_id);
         if (instance_it == instance_lookup.end() || instance_it->second.print_instance == nullptr || instance_it->second.print_instance->model_instance == nullptr)
             continue;
 
@@ -306,12 +422,14 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
         if (final_volume_mm3 <= 0.0)
             continue;
 
-        const ModelInstance* model_instance = instance_it->second.print_instance->model_instance;
-        const Eigen::Transform<double, 3, Eigen::Affine> inv = model_instance->get_matrix().inverse();
-        const Vec3d prev_plate = Vec3d(double(prev.position.x()) - plate_origin.x(), double(prev.position.y()) - plate_origin.y(), double(prev.position.z()) - plate_origin.z());
-        const Vec3d curr_plate = Vec3d(double(curr.position.x()) - plate_origin.x(), double(curr.position.y()) - plate_origin.y(), double(curr.position.z()) - plate_origin.z());
-        const Vec3d prev_obj = inv * prev_plate;
-        const Vec3d curr_obj = inv * curr_plate;
+        if (chosen_lookup == nullptr)
+            chosen_lookup = &instance_it->second;
+
+        const ModelInstance* model_instance = chosen_lookup->print_instance->model_instance;
+        if (curr.object_label_id >= 0) {
+            prev_obj = chosen_lookup->object_to_plate_inv * prev_plate;
+            curr_obj = chosen_lookup->object_to_plate_inv * curr_plate;
+        }
         const Vec3d delta_obj = curr_obj - prev_obj;
         const double length_mm = delta_obj.norm();
         if (length_mm <= 1e-9)
@@ -330,13 +448,13 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
         const Arr3 axis = to_arr3(delta_obj.normalized());
         const Arr3 com = to_arr3(0.5 * (prev_obj + curr_obj));
 
-        ObjectAccumulator& acc = accumulators[curr.object_label_id];
+        ObjectAccumulator& acc = accumulators[effective_label_id];
         if (acc.result.object_name.empty()) {
-            acc.result.object_label_id = curr.object_label_id;
+            acc.result.object_label_id = effective_label_id;
             acc.result.plate_index = plate_result.plate_index;
-            acc.result.instance_id = instance_it->second.instance_id;
+            acc.result.instance_id = chosen_lookup->instance_id;
             acc.result.model_object_id = size_t(model_instance->get_object()->id().id);
-            acc.result.object_name = instance_it->second.object_name;
+            acc.result.object_name = chosen_lookup->object_name;
         }
 
         ++acc.result.extrusion_moves_total;
@@ -360,16 +478,15 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
         }
     }
 
-    std::ostringstream move_labels_ss;
-    for (int label_id : seen_move_labels) {
-        if (move_labels_ss.tellp() > 0)
-            move_labels_ss << ',';
-        move_labels_ss << label_id;
-    }
+    const std::string move_labels = join_values(seen_move_labels);
     BOOST_LOG_TRIVIAL(info) << "Inertia analysis: plate " << plate_result.plate_index
+                            << " eligible part extrusion moves=" << eligible_extrusion_moves
                             << " labeled extrusion moves=" << labeled_extrusion_moves
+                            << ", unlabeled=" << unlabeled_extrusion_moves
                             << ", matched=" << matched_extrusion_moves
-                            << ", move labels=[" << move_labels_ss.str() << "]";
+                            << ", single-instance fallback=" << single_instance_fallback_moves
+                            << ", bbox-resolved unlabeled=" << bbox_resolved_unlabeled_moves
+                            << ", move labels=[" << move_labels << "]";
 
     for (auto& [label_id, acc] : accumulators) {
         (void)label_id;
@@ -407,8 +524,21 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
     });
 
     plate_result.ok = ! plate_result.objects.empty();
-    if (! plate_result.ok && plate_result.error_message.empty())
-        plate_result.error_message = "No per-object part extrusions could be analyzed from the preview toolpaths.";
+    if (! plate_result.ok && plate_result.error_message.empty()) {
+        std::ostringstream ss;
+        ss << "No per-object part extrusions could be analyzed from the preview toolpaths."
+           << "\nEligible part extrusion moves: " << eligible_extrusion_moves
+           << "\nLabeled part extrusion moves: " << labeled_extrusion_moves
+           << "\nUnlabeled part extrusion moves: " << unlabeled_extrusion_moves
+           << "\nMatched part extrusion moves: " << matched_extrusion_moves
+           << "\nPreview move object labels: [" << (move_labels.empty() ? std::string("none") : move_labels) << "]"
+           << "\nCurrent plate instance labels: [" << instance_labels << "]";
+        if (use_single_instance_fallback)
+            ss << "\nSingle-instance fallback label: " << single_instance_label_id << " (used for " << single_instance_fallback_moves << " unlabeled moves)";
+        else
+            ss << "\nGeometry fallback assigned unlabeled moves by transformed object bounds: " << bbox_resolved_unlabeled_moves;
+        plate_result.error_message = ss.str();
+    }
     return plate_result;
 }
 
