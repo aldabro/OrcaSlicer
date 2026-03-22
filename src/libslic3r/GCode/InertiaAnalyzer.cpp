@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <ctime>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <set>
@@ -29,6 +31,11 @@ static double dot(const Arr3& a, const Arr3& b)
 static Arr3 sub(const Arr3& a, const Arr3& b)
 {
     return { a[0] - b[0], a[1] - b[1], a[2] - b[2] };
+}
+
+static Arr3 add(const Arr3& a, const Arr3& b)
+{
+    return { a[0] + b[0], a[1] + b[1], a[2] + b[2] };
 }
 
 static Mat3d add(const Mat3d& a, const Mat3d& b)
@@ -176,19 +183,65 @@ static std::map<int, InstanceLookup> build_instance_lookup(const Print& print)
         if (print_object == nullptr || print_object->model_object() == nullptr)
             continue;
         const PrintInstances& instances = print_object->instances();
-        for (size_t instance_idx = 0; instance_idx < instances.size(); ++instance_idx) {
-            const PrintInstance& instance = instances[instance_idx];
+        for (const PrintInstance& instance : instances) {
             if (instance.model_instance == nullptr)
                 continue;
+            const size_t exported_instance_id = (instance.model_instance->arrange_order > 0) ?
+                size_t(instance.model_instance->arrange_order) :
+                (instance.id + 1);
             lookup[int(instance.model_instance->get_labeled_id())] = InstanceLookup{
                 &instance,
-                instance_idx,
+                exported_instance_id,
                 print_object->model_object()->name,
                 instance.model_instance->get_matrix().inverse()
             };
         }
     }
     return lookup;
+}
+
+static Arr3 reconstructed_source_frame_shift_mm(const PrintInstance& print_instance)
+{
+    Arr3 shift{ 0.0, 0.0, 0.0 };
+
+    if (print_instance.print_object != nullptr) {
+        const Point& center_offset = print_instance.print_object->center_offset();
+        shift[0] -= unscale<double>(center_offset.x());
+        shift[1] -= unscale<double>(center_offset.y());
+    }
+
+    if (print_instance.model_instance != nullptr && print_instance.model_instance->get_object() != nullptr) {
+        const ModelObject* model_object = print_instance.model_instance->get_object();
+        const Vec3d& origin_translation = model_object->origin_translation;
+        shift[0] -= origin_translation.x();
+        shift[1] -= origin_translation.y();
+        shift[2] -= origin_translation.z();
+
+        for (const ModelVolume* volume : model_object->volumes) {
+            if (volume == nullptr || ! volume->is_model_part())
+                continue;
+            shift[0] += volume->source.mesh_offset.x();
+            shift[1] += volume->source.mesh_offset.y();
+            shift[2] += volume->source.mesh_offset.z();
+            break;
+        }
+    }
+
+    return shift;
+}
+
+static std::string export_timestamp_utc()
+{
+    const std::time_t now = std::time(nullptr);
+    std::tm tm_utc{};
+#ifdef _WIN32
+    gmtime_s(&tm_utc, &now);
+#else
+    gmtime_r(&now, &tm_utc);
+#endif
+    std::ostringstream ss;
+    ss << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%SZ");
+    return ss.str();
 }
 
 } // namespace
@@ -230,9 +283,9 @@ GCodeInertiaResult analyze_gcode_inertia(const GCodeProcessorResult& gcode_resul
         if (length_mm <= 1e-9)
             continue;
 
-        double volume_mm3 = double(curr.mm3_per_mm) * double(curr.travel_dist);
-        if (volume_mm3 <= 0.0)
-            volume_mm3 = double(curr.mm3_per_mm) * length_mm;
+        double volume_mm3 = double(curr.mm3_per_mm) * length_mm;
+        if (volume_mm3 <= 0.0 && double(curr.travel_dist) > 0.0)
+            volume_mm3 = double(curr.mm3_per_mm) * double(curr.travel_dist);
         if (volume_mm3 <= 0.0)
             continue;
 
@@ -309,6 +362,7 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
         GCodeInertiaObjectResult result;
         std::vector<SegmentRecord> records;
         Arr3 weighted_com{ 0.0, 0.0, 0.0 };
+        Arr3 source_frame_shift_mm{ 0.0, 0.0, 0.0 };
     };
 
     std::map<int, ObjectAccumulator> accumulators;
@@ -347,12 +401,12 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
 
         ++matched_extrusion_moves;
 
-        const double volume_mm3 = (double(curr.mm3_per_mm) > 0.0) ? std::max(double(curr.mm3_per_mm) * double(curr.travel_dist), 0.0) : 0.0;
         const double dx_world = double(curr.position.x() - prev.position.x());
         const double dy_world = double(curr.position.y() - prev.position.y());
         const double dz_world = double(curr.position.z() - prev.position.z());
         const double world_len = std::sqrt(dx_world * dx_world + dy_world * dy_world + dz_world * dz_world);
-        const double final_volume_mm3 = volume_mm3 > 0.0 ? volume_mm3 : double(curr.mm3_per_mm) * world_len;
+        const double volume_mm3 = (double(curr.mm3_per_mm) > 0.0) ? std::max(double(curr.mm3_per_mm) * world_len, 0.0) : 0.0;
+        const double final_volume_mm3 = volume_mm3 > 0.0 ? volume_mm3 : double(curr.mm3_per_mm) * double(curr.travel_dist);
         if (final_volume_mm3 <= 0.0)
             continue;
 
@@ -385,6 +439,7 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
             acc.result.instance_id = chosen_lookup->instance_id;
             acc.result.model_object_id = size_t(model_instance->get_object()->id().id);
             acc.result.object_name = chosen_lookup->object_name;
+            acc.source_frame_shift_mm = reconstructed_source_frame_shift_mm(*chosen_lookup->print_instance);
         }
 
         ++acc.result.extrusion_moves_total;
@@ -438,10 +493,14 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
             inertia_origin = add(inertia_origin, add(segment_body, parallel_axis(rec.mass_kg, rec.com)));
         }
 
+        const Arr3 source_com = add(com, acc.source_frame_shift_mm);
+
         acc.result.ok = true;
-        acc.result.center_of_mass_in_object_frame_mm = com;
+        acc.result.center_of_mass_in_slicer_object_frame_mm = com;
+        acc.result.center_of_mass_in_source_frame_mm = source_com;
         acc.result.inertia_about_com_kg_mm2 = inertia_com;
         acc.result.inertia_about_object_origin_kg_mm2 = inertia_origin;
+        acc.result.inertia_about_source_origin_kg_mm2 = add(inertia_com, parallel_axis(acc.result.mass_kg, source_com));
         plate_result.objects.push_back(acc.result);
     }
 
@@ -506,6 +565,7 @@ std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
 {
     OrderedJson root;
     root["schema_version"] = 1;
+    root["exported_at_utc"] = export_timestamp_utc();
     root["generator"] = "OrcaSlicer";
     root["analysis_type"] = "toolpath_inertia";
     root["plate_index"] = result.plate_index;
@@ -513,8 +573,9 @@ std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
     if (! result.error_message.empty())
         root["error_message"] = result.error_message;
     root["reference_frames"] = {
-        { "object_origin", "Original object/model coordinate system" },
-        { "com_frame", "Same axis orientation as object frame, translated to the center of mass" }
+        { "source_origin", "Reconstructed source/CAD-like object coordinate system before Orca centering transforms" },
+        { "slicer_object_origin", "Internal Orca slicer object coordinate system after Orca centering transforms" },
+        { "com_frame", "Same axis orientation as the chosen object frame, translated to that frame's center of mass" }
     };
     root["inertia_tensor_convention"] = {
         { "units", "kg*mm^2" },
@@ -540,8 +601,9 @@ std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
         j["used_density_from_extruders"] = true;
         if (! object.error_message.empty())
             j["error_message"] = object.error_message;
-        j["center_of_mass_in_object_frame_mm"] = to_json_array(object.center_of_mass_in_object_frame_mm);
-        j["origin_to_com_offset_mm"] = to_json_array(object.center_of_mass_in_object_frame_mm);
+        j["center_of_mass_in_source_frame_mm"] = to_json_array(object.center_of_mass_in_source_frame_mm);
+        j["origin_to_com_offset_mm"] = to_json_array(object.center_of_mass_in_source_frame_mm);
+        j["center_of_mass_in_slicer_object_frame_mm"] = to_json_array(object.center_of_mass_in_slicer_object_frame_mm);
         j["materials"] = OrderedJson::array();
         for (const GCodeInertiaMaterialUsage& material : object.materials) {
             j["materials"].push_back({
@@ -552,6 +614,7 @@ std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
             });
         }
         j["inertia_tensors_kg_mm2"] = {
+            { "about_source_origin", to_json_named_inertia(object.inertia_about_source_origin_kg_mm2) },
             { "about_object_origin", to_json_named_inertia(object.inertia_about_object_origin_kg_mm2) },
             { "about_center_of_mass", to_json_named_inertia(object.inertia_about_com_kg_mm2) }
         };

@@ -55,8 +55,10 @@ struct GCodeInertiaObjectResult
     size_t extrusion_moves_used{ 0 };
     double volume_mm3{ 0.0 };
     double mass_kg{ 0.0 };
-    std::array<double, 3> center_of_mass_in_object_frame_mm{ 0.0, 0.0, 0.0 };
+    std::array<double, 3> center_of_mass_in_slicer_object_frame_mm{ 0.0, 0.0, 0.0 };
+    std::array<double, 3> center_of_mass_in_source_frame_mm{ 0.0, 0.0, 0.0 };
     std::array<std::array<double, 3>, 3> inertia_about_object_origin_kg_mm2{{ {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0} }};
+    std::array<std::array<double, 3>, 3> inertia_about_source_origin_kg_mm2{{ {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0} }};
     std::array<std::array<double, 3>, 3> inertia_about_com_kg_mm2{{ {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0} }};
     std::vector<GCodeInertiaMaterialUsage> materials;
 };
