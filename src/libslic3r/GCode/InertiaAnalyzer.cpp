@@ -132,6 +132,19 @@ static nlohmann::json to_json_matrix(const Mat3d& m)
     });
 }
 
+static nlohmann::json to_json_named_inertia(const Mat3d& m)
+{
+    return {
+        { "I_xx", m[0][0] },
+        { "I_yy", m[1][1] },
+        { "I_zz", m[2][2] },
+        { "I_xy", m[0][1] },
+        { "I_xz", m[0][2] },
+        { "I_yz", m[1][2] },
+        { "matrix_rows", to_json_matrix(m) }
+    };
+}
+
 template <typename T>
 static std::string join_values(const std::set<T>& values)
 {
@@ -594,25 +607,30 @@ std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
         { "object_origin", "Original object/model coordinate system" },
         { "com_frame", "Same axis orientation as object frame, translated to the center of mass" }
     };
+    root["inertia_tensor_convention"] = {
+        { "units", "kg*mm^2" },
+        { "products_of_inertia", nlohmann::json::array({ "I_xy", "I_xz", "I_yz" }) },
+        { "matrix_layout", nlohmann::json::array({
+            nlohmann::json::array({ "I_xx", "I_xy", "I_xz" }),
+            nlohmann::json::array({ "I_xy", "I_yy", "I_yz" }),
+            nlohmann::json::array({ "I_xz", "I_yz", "I_zz" })
+        }) }
+    };
     root["objects"] = nlohmann::json::array();
 
     for (const GCodeInertiaObjectResult& object : result.objects) {
         nlohmann::json j;
         j["ok"] = object.ok;
         j["object_name"] = object.object_name;
-        j["object_label_id"] = object.object_label_id;
         j["instance_id"] = object.instance_id;
         j["model_object_id"] = object.model_object_id;
+        j["object_label_id"] = object.object_label_id;
         j["plate_index"] = object.plate_index;
-        j["mass_kg"] = object.mass_kg;
         j["volume_mm3"] = object.volume_mm3;
+        j["mass_kg"] = object.mass_kg;
         j["used_density_from_extruders"] = true;
         j["center_of_mass_in_object_frame_mm"] = to_json_array(object.center_of_mass_in_object_frame_mm);
         j["origin_to_com_offset_mm"] = to_json_array(object.center_of_mass_in_object_frame_mm);
-        j["inertia_about_object_origin_kg_mm2"] = to_json_matrix(object.inertia_about_object_origin_kg_mm2);
-        j["inertia_about_com_kg_mm2"] = to_json_matrix(object.inertia_about_com_kg_mm2);
-        if (! object.error_message.empty())
-            j["error_message"] = object.error_message;
         j["materials"] = nlohmann::json::array();
         for (const GCodeInertiaMaterialUsage& material : object.materials) {
             j["materials"].push_back({
@@ -622,6 +640,12 @@ std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
                 { "volume_mm3", material.volume_mm3 }
             });
         }
+        j["inertia_tensors_kg_mm2"] = {
+            { "about_object_origin", to_json_named_inertia(object.inertia_about_object_origin_kg_mm2) },
+            { "about_center_of_mass", to_json_named_inertia(object.inertia_about_com_kg_mm2) }
+        };
+        if (! object.error_message.empty())
+            j["error_message"] = object.error_message;
         root["objects"].push_back(j);
     }
 
