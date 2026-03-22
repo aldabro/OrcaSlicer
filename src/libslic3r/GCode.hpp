@@ -541,6 +541,7 @@ private:
     // of the G-code lines: _EXTRUDE_SET_SPEED, _WIPE, _OVERHANG_FAN_START, _OVERHANG_FAN_END
     // Those comments are received and consumed (removed from the G-code) by the CoolingBuffer.pm Perl module.
     bool                                m_enable_cooling_markers;
+    bool                                m_emit_preview_object_labels{ false };
     
     bool m_enable_exclude_object;
     std::vector<size_t> m_label_objects_ids;

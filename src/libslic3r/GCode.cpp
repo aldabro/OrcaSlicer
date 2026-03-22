@@ -2008,6 +2008,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     GCodeProcessor::s_IsBBLPrinter = print->is_BBL_printer();
     m_writer.set_is_bbl_machine(print->is_BBL_printer());
+    m_emit_preview_object_labels = (result != nullptr);
     print->set_started(psGCodeExport);
 
     // check if any custom gcode contains keywords used by the gcode processor to
@@ -2158,7 +2159,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     BOOST_LOG_TRIVIAL(info) << "Exporting G-code finished" << log_memory_info();
     print->set_done(psGCodeExport);
     
-    if(is_BBL_Printer())
+    if (result != nullptr && is_BBL_Printer())
         result->label_object_enabled = m_enable_exclude_object;
     // Write the profiler measurements to file
     PROFILE_UPDATE();
@@ -5131,6 +5132,10 @@ LayerResult GCode::process_layer(
                 if (m_config.reduce_crossing_wall)
                     m_avoid_crossing_perimeters.init_layer(*m_layer);
 
+                if (m_emit_preview_object_labels) {
+                    gcode += std::string("; start printing object, unique label id: ") +
+                             std::to_string(instance_to_print.label_object_id) + "\n";
+                }
                 if (this->config().gcode_label_objects) {
                     gcode += std::string("; printing object ") + instance_to_print.print_object.model_object()->name +
                              " id:" + std::to_string(instance_to_print.print_object.get_id()) + " copy " +
@@ -5273,6 +5278,10 @@ LayerResult GCode::process_layer(
                              instance_to_print.print_object.model_object()->name +
                              " id:" + std::to_string(instance_to_print.print_object.get_id()) + " copy " +
                              std::to_string(inst.id) + "\n";
+                }
+                if (m_emit_preview_object_labels) {
+                    gcode += std::string("; stop printing object, unique label id: ") +
+                             std::to_string(instance_to_print.label_object_id) + "\n";
                 }
                 // exclude objects
                 // Don't set m_gcode_label_objects_end if you don't had to write the m_gcode_label_objects_start.

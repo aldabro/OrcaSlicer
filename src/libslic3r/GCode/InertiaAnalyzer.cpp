@@ -19,6 +19,7 @@ constexpr double PI = 3.14159265358979323846;
 
 using Arr3 = std::array<double, 3>;
 using Mat3d = std::array<std::array<double, 3>, 3>;
+using OrderedJson = nlohmann::ordered_json;
 
 static double dot(const Arr3& a, const Arr3& b)
 {
@@ -109,7 +110,6 @@ struct InstanceLookup
     const PrintInstance* print_instance{ nullptr };
     size_t instance_id{ 0 };
     std::string object_name;
-    BoundingBoxf3 raw_mesh_bbox;
     Eigen::Transform<double, 3, Eigen::Affine> object_to_plate_inv = Eigen::Transform<double, 3, Eigen::Affine>::Identity();
 };
 
@@ -118,21 +118,21 @@ static Arr3 to_arr3(const Vec3d& v)
     return { v.x(), v.y(), v.z() };
 }
 
-static nlohmann::json to_json_array(const Arr3& v)
+static OrderedJson to_json_array(const Arr3& v)
 {
-    return nlohmann::json::array({ v[0], v[1], v[2] });
+    return OrderedJson::array({ v[0], v[1], v[2] });
 }
 
-static nlohmann::json to_json_matrix(const Mat3d& m)
+static OrderedJson to_json_matrix(const Mat3d& m)
 {
-    return nlohmann::json::array({
-        nlohmann::json::array({ m[0][0], m[0][1], m[0][2] }),
-        nlohmann::json::array({ m[1][0], m[1][1], m[1][2] }),
-        nlohmann::json::array({ m[2][0], m[2][1], m[2][2] })
+    return OrderedJson::array({
+        OrderedJson::array({ m[0][0], m[0][1], m[0][2] }),
+        OrderedJson::array({ m[1][0], m[1][1], m[1][2] }),
+        OrderedJson::array({ m[2][0], m[2][1], m[2][2] })
     });
 }
 
-static nlohmann::json to_json_named_inertia(const Mat3d& m)
+static OrderedJson to_json_named_inertia(const Mat3d& m)
 {
     return {
         { "I_xx", m[0][0] },
@@ -169,64 +169,6 @@ static std::string join_instance_labels(const std::map<int, InstanceLookup>& loo
     return join_values(labels);
 }
 
-template <typename BBoxType>
-static double point_to_bbox_distance_sq(const BBoxType& bbox, const Vec3d& point)
-{
-    const auto axis_distance_sq = [](double value, double min_v, double max_v) {
-        if (value < min_v) {
-            const double d = min_v - value;
-            return d * d;
-        }
-        if (value > max_v) {
-            const double d = value - max_v;
-            return d * d;
-        }
-        return 0.0;
-    };
-
-    return axis_distance_sq(point.x(), bbox.min.x(), bbox.max.x()) +
-           axis_distance_sq(point.y(), bbox.min.y(), bbox.max.y()) +
-           axis_distance_sq(point.z(), bbox.min.z(), bbox.max.z());
-}
-
-struct ResolvedUnlabeledInstance
-{
-    int label_id{ -1 };
-    const InstanceLookup* lookup{ nullptr };
-    Vec3d prev_obj{ Vec3d::Zero() };
-    Vec3d curr_obj{ Vec3d::Zero() };
-};
-
-static ResolvedUnlabeledInstance resolve_unlabeled_instance(const std::map<int, InstanceLookup>& instance_lookup, const Vec3d& prev_plate, const Vec3d& curr_plate)
-{
-    constexpr double containment_tolerance_mm = 1.0;
-
-    ResolvedUnlabeledInstance best;
-    double best_distance_sq = std::numeric_limits<double>::infinity();
-    bool found_contained = false;
-    const Vec3d midpoint_plate = 0.5 * (prev_plate + curr_plate);
-
-    for (const auto& [label_id, lookup] : instance_lookup) {
-        const Vec3d prev_obj = lookup.object_to_plate_inv * prev_plate;
-        const Vec3d curr_obj = lookup.object_to_plate_inv * curr_plate;
-        const Vec3d midpoint_obj = lookup.object_to_plate_inv * midpoint_plate;
-        const auto bbox = lookup.raw_mesh_bbox.inflated(containment_tolerance_mm);
-        const bool contained = bbox.contains(midpoint_obj);
-        const double distance_sq = point_to_bbox_distance_sq(bbox, midpoint_obj);
-
-        if ((contained && ! found_contained) || (contained == found_contained && distance_sq < best_distance_sq)) {
-            found_contained = contained;
-            best_distance_sq = distance_sq;
-            best.label_id = label_id;
-            best.lookup = &lookup;
-            best.prev_obj = prev_obj;
-            best.curr_obj = curr_obj;
-        }
-    }
-
-    return best;
-}
-
 static std::map<int, InstanceLookup> build_instance_lookup(const Print& print)
 {
     std::map<int, InstanceLookup> lookup;
@@ -242,7 +184,6 @@ static std::map<int, InstanceLookup> build_instance_lookup(const Print& print)
                 &instance,
                 instance_idx,
                 print_object->model_object()->name,
-                print_object->model_object()->raw_mesh_bounding_box(),
                 instance.model_instance->get_matrix().inverse()
             };
         }
@@ -377,10 +318,6 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
     size_t labeled_extrusion_moves = 0;
     size_t unlabeled_extrusion_moves = 0;
     size_t matched_extrusion_moves = 0;
-    size_t single_instance_fallback_moves = 0;
-    size_t bbox_resolved_unlabeled_moves = 0;
-    const bool use_single_instance_fallback = instance_lookup.size() == 1;
-    const int single_instance_label_id = use_single_instance_fallback ? instance_lookup.begin()->first : -1;
 
     for (size_t i = 1; i < gcode_result.moves.size(); ++i) {
         const auto& prev = gcode_result.moves[i - 1];
@@ -396,32 +333,14 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
         const Vec3d prev_plate = Vec3d(double(prev.position.x()) - plate_origin.x(), double(prev.position.y()) - plate_origin.y(), double(prev.position.z()) - plate_origin.z());
         const Vec3d curr_plate = Vec3d(double(curr.position.x()) - plate_origin.x(), double(curr.position.y()) - plate_origin.y(), double(curr.position.z()) - plate_origin.z());
 
-        int effective_label_id = curr.object_label_id;
-        const InstanceLookup* chosen_lookup = nullptr;
-        Vec3d prev_obj;
-        Vec3d curr_obj;
-        bool have_object_space_segment = false;
         if (curr.object_label_id < 0) {
             ++unlabeled_extrusion_moves;
-            if (use_single_instance_fallback) {
-                effective_label_id = single_instance_label_id;
-                ++single_instance_fallback_moves;
-            } else {
-                const ResolvedUnlabeledInstance resolved = resolve_unlabeled_instance(instance_lookup, prev_plate, curr_plate);
-                if (resolved.lookup == nullptr)
-                    continue;
-                effective_label_id = resolved.label_id;
-                chosen_lookup = resolved.lookup;
-                prev_obj = resolved.prev_obj;
-                curr_obj = resolved.curr_obj;
-                have_object_space_segment = true;
-                ++bbox_resolved_unlabeled_moves;
-            }
-        } else {
-            ++labeled_extrusion_moves;
-            seen_move_labels.insert(curr.object_label_id);
+            continue;
         }
+        ++labeled_extrusion_moves;
+        seen_move_labels.insert(curr.object_label_id);
 
+        const int effective_label_id = curr.object_label_id;
         const auto instance_it = instance_lookup.find(effective_label_id);
         if (instance_it == instance_lookup.end() || instance_it->second.print_instance == nullptr || instance_it->second.print_instance->model_instance == nullptr)
             continue;
@@ -437,14 +356,10 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
         if (final_volume_mm3 <= 0.0)
             continue;
 
-        if (chosen_lookup == nullptr)
-            chosen_lookup = &instance_it->second;
-
+        const InstanceLookup* chosen_lookup = &instance_it->second;
         const ModelInstance* model_instance = chosen_lookup->print_instance->model_instance;
-        if (! have_object_space_segment) {
-            prev_obj = chosen_lookup->object_to_plate_inv * prev_plate;
-            curr_obj = chosen_lookup->object_to_plate_inv * curr_plate;
-        }
+        const Vec3d prev_obj = chosen_lookup->object_to_plate_inv * prev_plate;
+        const Vec3d curr_obj = chosen_lookup->object_to_plate_inv * curr_plate;
         const Vec3d delta_obj = curr_obj - prev_obj;
         const double length_mm = delta_obj.norm();
         if (length_mm <= 1e-9)
@@ -499,8 +414,6 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
                             << " labeled extrusion moves=" << labeled_extrusion_moves
                             << ", unlabeled=" << unlabeled_extrusion_moves
                             << ", matched=" << matched_extrusion_moves
-                            << ", single-instance fallback=" << single_instance_fallback_moves
-                            << ", bbox-resolved unlabeled=" << bbox_resolved_unlabeled_moves
                             << ", move labels=[" << move_labels << "]";
 
     for (auto& [label_id, acc] : accumulators) {
@@ -548,10 +461,6 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
            << "\nMatched part extrusion moves: " << matched_extrusion_moves
            << "\nPreview move object labels: [" << (move_labels.empty() ? std::string("none") : move_labels) << "]"
            << "\nCurrent plate instance labels: [" << instance_labels << "]";
-        if (use_single_instance_fallback)
-            ss << "\nSingle-instance fallback label: " << single_instance_label_id << " (used for " << single_instance_fallback_moves << " unlabeled moves)";
-        else
-            ss << "\nGeometry fallback assigned unlabeled moves by transformed object bounds: " << bbox_resolved_unlabeled_moves;
         plate_result.error_message = ss.str();
     }
     return plate_result;
@@ -595,7 +504,7 @@ std::string format_gcode_inertia_report(const GCodeInertiaResult& result)
 
 std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
 {
-    nlohmann::json root;
+    OrderedJson root;
     root["schema_version"] = 1;
     root["generator"] = "OrcaSlicer";
     root["analysis_type"] = "toolpath_inertia";
@@ -609,29 +518,31 @@ std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
     };
     root["inertia_tensor_convention"] = {
         { "units", "kg*mm^2" },
-        { "products_of_inertia", nlohmann::json::array({ "I_xy", "I_xz", "I_yz" }) },
-        { "matrix_layout", nlohmann::json::array({
-            nlohmann::json::array({ "I_xx", "I_xy", "I_xz" }),
-            nlohmann::json::array({ "I_xy", "I_yy", "I_yz" }),
-            nlohmann::json::array({ "I_xz", "I_yz", "I_zz" })
+        { "products_of_inertia", OrderedJson::array({ "I_xy", "I_xz", "I_yz" }) },
+        { "matrix_layout", OrderedJson::array({
+            OrderedJson::array({ "I_xx", "I_xy", "I_xz" }),
+            OrderedJson::array({ "I_xy", "I_yy", "I_yz" }),
+            OrderedJson::array({ "I_xz", "I_yz", "I_zz" })
         }) }
     };
-    root["objects"] = nlohmann::json::array();
+    root["objects"] = OrderedJson::array();
 
     for (const GCodeInertiaObjectResult& object : result.objects) {
-        nlohmann::json j;
-        j["ok"] = object.ok;
+        OrderedJson j;
         j["object_name"] = object.object_name;
+        j["ok"] = object.ok;
         j["instance_id"] = object.instance_id;
         j["model_object_id"] = object.model_object_id;
         j["object_label_id"] = object.object_label_id;
         j["plate_index"] = object.plate_index;
-        j["volume_mm3"] = object.volume_mm3;
         j["mass_kg"] = object.mass_kg;
+        j["volume_mm3"] = object.volume_mm3;
         j["used_density_from_extruders"] = true;
+        if (! object.error_message.empty())
+            j["error_message"] = object.error_message;
         j["center_of_mass_in_object_frame_mm"] = to_json_array(object.center_of_mass_in_object_frame_mm);
         j["origin_to_com_offset_mm"] = to_json_array(object.center_of_mass_in_object_frame_mm);
-        j["materials"] = nlohmann::json::array();
+        j["materials"] = OrderedJson::array();
         for (const GCodeInertiaMaterialUsage& material : object.materials) {
             j["materials"].push_back({
                 { "extruder_id", material.extruder_id },
@@ -644,8 +555,6 @@ std::string format_gcode_inertia_json(const GCodeInertiaPlateResult& result)
             { "about_object_origin", to_json_named_inertia(object.inertia_about_object_origin_kg_mm2) },
             { "about_center_of_mass", to_json_named_inertia(object.inertia_about_com_kg_mm2) }
         };
-        if (! object.error_message.empty())
-            j["error_message"] = object.error_message;
         root["objects"].push_back(j);
     }
 
