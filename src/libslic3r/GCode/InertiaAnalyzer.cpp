@@ -387,6 +387,7 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
         const InstanceLookup* chosen_lookup = nullptr;
         Vec3d prev_obj;
         Vec3d curr_obj;
+        bool have_object_space_segment = false;
         if (curr.object_label_id < 0) {
             ++unlabeled_extrusion_moves;
             if (use_single_instance_fallback) {
@@ -400,6 +401,7 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
                 chosen_lookup = resolved.lookup;
                 prev_obj = resolved.prev_obj;
                 curr_obj = resolved.curr_obj;
+                have_object_space_segment = true;
                 ++bbox_resolved_unlabeled_moves;
             }
         } else {
@@ -426,7 +428,7 @@ GCodeInertiaPlateResult analyze_gcode_inertia_by_object(const GCodeProcessorResu
             chosen_lookup = &instance_it->second;
 
         const ModelInstance* model_instance = chosen_lookup->print_instance->model_instance;
-        if (curr.object_label_id >= 0) {
+        if (! have_object_space_segment) {
             prev_obj = chosen_lookup->object_to_plate_inv * prev_plate;
             curr_obj = chosen_lookup->object_to_plate_inv * curr_plate;
         }
